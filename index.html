@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>Pricing Calculator 定价计算器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Pricing Calculator <small>定价计算器</small></h1>
+  <button type="button" id="pdfBtn" class="noprint">Download PDF<small>下载PDF</small></button>
+</header>
+<main>
+  <section id="scenarios" class="card"></section>
+  <section id="globals" class="card">
+    <h2>Global settings <small>全局设置</small></h2>
+    <div id="globalFields" class="grid"></div>
+    <div id="splitCheck" class="note"></div>
+    <div id="cnyRef" class="note"></div>
+    <p class="note">Shipping surcharge does not fully cover PayPal's fee on shipping; the small shortfall is borne by the partners.
+      <small>运费附加费无法完全覆盖运费部分的PayPal手续费,差额由合伙人承担。</small></p>
+  </section>
+  <p class="note">Unrounded values <small>未四舍五入</small></p>
+  <section id="designs" class="designs"></section>
+  <section id="yearly" class="card"></section>
+  <section id="charts"></section>
+  <section id="sweeps"></section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
