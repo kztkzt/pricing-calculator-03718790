@@ -82,6 +82,7 @@ h1 small { display: inline-block; white-space: nowrap; }
 .lbl small { display: block; margin: 0; line-height: var(--lh); }
 input, select { font: inherit; font-size: var(--fs-md); height: var(--control-h); padding: 0 var(--sp-3); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); width: 100%; min-width: 0; }
 input:focus-visible, select:focus-visible, .btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+input::placeholder { color: var(--muted); opacity: 1; } /* default placeholder grey is 3.78:1 in dark mode; --muted passes 4.5:1 in both themes */
 input.bad { border-color: var(--danger); background: var(--danger-soft); }
 .note { font-size: var(--fs-sm); color: var(--muted); margin: var(--sp-3) 0 0; }
 .note small { display: block; margin: 0; }
@@ -119,7 +120,7 @@ input.bad { border-color: var(--danger); background: var(--danger-soft); }
 .stat-k { display: block; font-size: var(--fs-sm); font-weight: 600; line-height: var(--lh); }
 .stat-k small { display: block; margin: 0; }
 .stat-v { display: block; margin-top: var(--sp-1); font-size: var(--fs-lg); line-height: 1.2; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.cur { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); margin-right: var(--sp-1); }
+.cur { font-size: var(--fs-xs); font-weight: 600; color: var(--muted); }
 .hero-main { background: var(--primary); border-color: var(--primary); color: var(--primary-contrast); }
 .hero-main small, .hero-main .cur { color: var(--primary-contrast); opacity: 0.85; }
 .hero-main .stat-v { font-size: var(--fs-xl); }

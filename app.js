@@ -3,7 +3,7 @@
 const __m_calcEngine = (() => {
 // Pricing calc engine. Pure functions, no UI, no floats: all math is exact BigInt fractions.
 // No rounding in the math. Output strings only cut the exact fraction to 4 decimals for display (half up).
-// IDR is not rounded unless the user sets idrStep > 0. Spec: docs/spec-v5.md.
+// IDR is not rounded unless the user sets idrStep > 0. Spec of record: vault Projects/Pricing Calculator/T1 Formula Spec.md + CR-3 spec v5 (docs/spec-v5.md).
 
 // ---- exact fractions: { n: BigInt, d: BigInt > 0 } ----
 const gcd = (a, b) => { a = a < 0n ? -a : a; while (b) [a, b] = [b, a % b]; return a; };
@@ -30,8 +30,10 @@ function parseDec(v, blank = null) {
   const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(String(v).trim());
   if (!m || (m[2] === '' && !m[3])) return null;
   const frac = m[3] || '';
+  const ex = m[4] ? parseInt(m[4], 10) : 0;
+  if (Math.abs(ex) > 30) return null; // 1e2000000 would build a giant BigInt and freeze the tab
   let n = BigInt(m[2] + frac || '0');
-  let e = (m[4] ? parseInt(m[4], 10) : 0) - frac.length;
+  let e = ex - frac.length;
   if (m[1] === '-') n = -n;
   return e >= 0 ? fr(n * 10n ** BigInt(e)) : fr(n, 10n ** BigInt(-e));
 }
@@ -402,8 +404,9 @@ function parseSnapshot(text, ids) {
 // store = localStorage-like (getItem/setItem). Throws if the browser blocks storage.
 function readAll(store) {
   const raw = store.getItem(KEY);
-  if (!raw) return {};
-  try { const o = JSON.parse(raw); return o && typeof o === 'object' ? o : {}; } catch { return {}; }
+  if (!raw) return Object.create(null);
+  // null-prototype copy: a scenario named "__proto__" is an ordinary key
+  try { const o = JSON.parse(raw); return Object.assign(Object.create(null), o && typeof o === 'object' ? o : {}); } catch { return Object.create(null); }
 }
 const listScenarios = (store) => Object.keys(readAll(store)).sort();
 const getScenario = (store, name) => readAll(store)[name] ?? null;
@@ -420,9 +423,38 @@ function deleteScenario(store, name) {
 
 return { APP, VERSION, makeSnapshot, parseSnapshot, listScenarios, getScenario, saveScenario, deleteScenario };
 })();
+const __m_format = (() => {
+// Pure text helpers for the UI (no DOM), so they run in node tests: input checks, percent text, error text, money text.
+const FIELD_NAMES = {
+  c: 'Unit cost 单位成本', m: 'Margin 利润率', f: 'PayPal % PayPal手续费', F: 'PayPal fixed fee 固定费用',
+  fxBuffer: 'FX buffer 汇率缓冲', idrStep: 'IDR rounding step 印尼盾进位单位', split: 'Split 分成',
+  Sc: 'Shipping cost 运费', s: 'Surcharge 附加费', u: 'Units 数量', K: 'Collab K 合作预算',
+};
+const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)$/;
+const blank = (v) => v === undefined || v === null || String(v).trim() === '';
+const okFormat = (type, v) => blank(v) || type === 'text' || type === 'date' || NUM_RE.test(v.trim());
+// plain decimal text, or the marker 'NaN' (never a valid number) so the engine reports "not a number"
+const plain = (v) => (blank(v) ? '' : NUM_RE.test(v.trim()) ? v.trim() : 'NaN');
+// percent text -> engine decimal text ("5" -> "5e-2"); anything that is not a plain decimal -> 'NaN' marker
+const pct = (v) => { const p = plain(v); return p === '' || p === 'NaN' ? p : p + 'e-2'; };
+const moneyCur = (c, s) => { const p = curParts(c, s); return p.sign + p.cur + ' ' + p.num; };
+const niceErr = (msg) => msg.replace(/^(\w+)/, (m, k) => FIELD_NAMES[k] || k)
+  .replace('Split 分成 must sum to 1', 'Split A + B + C must be 100% 分成合计须为100%')
+  .replace(' must be an integer >= 0', ' must be a whole number, 0 or more 必须是不小于0的整数')
+  .replace(' must be >= 0', ' must be 0 or more 必须不小于0')
+  .replace('margin too high', 'Margin + PayPal % must be below 100% 利润率+PayPal手续费须低于100%')
+  .replace(/ required$/, ' is required 必填').replace(/ invalid$/, ' is not a number (use a dot for decimals, e.g. 1.5) 不是有效数字(小数请用点号,例如 1.5)');
+const commas = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const money = (s) => { const neg = s.startsWith('-'); const [i, d] = (neg ? s.slice(1) : s).split('.'); return (neg ? '-' : '') + commas(i) + (d === undefined ? '' : '.' + d); };
+// currency + engine money string -> parts; the sign goes before the currency ("-USD 3,500.0000"), digits unchanged
+const curParts = (c, s) => { const neg = s.startsWith('-'); return { sign: neg ? '-' : '', cur: c, num: money(neg ? s.slice(1) : s) }; };
+
+return { NUM_RE, blank, okFormat, plain, pct, moneyCur, niceErr, money, curParts };
+})();
 const __m_ui = (() => {
 // Input UI. Wires fields to calcEngine.js; no math here except "5" -> "5e-2" percent text conversion.
 const { calcDesign, parseDec, splitSum, sweepDesign } = __m_calcEngine;
+const { blank, okFormat, pct, plain, niceErr, money, curParts } = __m_format;
 const { getCnyRate, SOURCE_PAGE } = __m_cnyRate;
 const { renderCharts } = __m_charts;
 const { DESIGN_DEFAULT } = __m_defaults;
@@ -464,24 +496,6 @@ const DESIGN_FIELDS = [
   { k: 'K', en: 'Collab budget K (USD, total for this design / release)', zh: '合作预算K(美元,本设计/本次发售合计)', type: 'num' },
 ];
 
-const FIELD_NAMES = {
-  c: 'Unit cost 单位成本', m: 'Margin 利润率', f: 'PayPal % PayPal手续费', F: 'PayPal fixed fee 固定费用',
-  fxBuffer: 'FX buffer 汇率缓冲', idrStep: 'IDR rounding step 印尼盾进位单位', split: 'Split 分成',
-  Sc: 'Shipping cost 运费', s: 'Surcharge 附加费', u: 'Units 数量', K: 'Collab K 合作预算',
-};
-const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)$/;
-const blank = (v) => v === undefined || v === null || String(v).trim() === '';
-const okFormat = (type, v) => blank(v) || type === 'text' || type === 'date' || NUM_RE.test(v.trim());
-// percent text -> engine decimal text ("5" -> "5e-2"); bad text passes through so the engine rejects it
-const pct = (v) => (blank(v) ? '' : NUM_RE.test(v.trim()) ? v.trim() + 'e-2' : v);
-const niceErr = (msg) => msg.replace(/^(\w+)/, (m, k) => FIELD_NAMES[k] || k)
-  .replace('Split 分成 must sum to 1', 'Split A + B + C must be 100% 分成合计须为100%')
-  .replace(' must be an integer >= 0', ' must be a whole number, 0 or more 必须是不小于0的整数')
-  .replace(' must be >= 0', ' must be 0 or more 必须不小于0')
-  .replace('margin too high', 'Margin + PayPal % must be below 100% 利润率+PayPal手续费须低于100%')
-  .replace(/ required$/, ' is required 必填').replace(/ invalid$/, ' is not a number 不是有效数字');
-const commas = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-const money = (s) => { const neg = s.startsWith('-'); const [i, d] = (neg ? s.slice(1) : s).split('.'); return (neg ? '-' : '') + commas(i) + (d === undefined ? '' : '.' + d); };
 
 let live = { rate: null, date: null, source: null, done: false };
 
@@ -551,13 +565,13 @@ function drawCharts(r, rows) {
 }
 
 function rates() {
-  const m = val('cnyManual').trim();
+  const m = plain(val('cnyManual'));
   let r = null, src = '';
   if (!blank(m)) {
     const p = parseDec(m);
     if (p && p.n > 0n) { r = m; src = 'manual 手动'; }
   } else if (live.rate) { r = String(live.rate); src = 'live 实时'; }
-  const x = val('idrRate').trim();
+  const x = plain(val('idrRate'));
   const xp = blank(x) ? null : parseDec(x);
   return { r, x: xp && xp.n > 0n ? x : null, src };
 }
@@ -584,10 +598,9 @@ function render() {
   $('splitCheck').replaceChildren(ss
     ? el('span', { class: ss.ok ? 'ok' : 'err' }, `Split sum 分成合计: ${ss.text}%` + (ss.ok ? ' ✓' : ' — must be 100% 须为100%'))
     : el('span', { class: 'err' }, 'Split sum 分成合计: — (enter numbers 请输入数字)'));
-  const g = { f: pct(val('paypalPct')), s: pct(val('surcharge')), fxBuffer: pct(val('fxBuffer')), idrStep: val('idrStep'), split: sp };
+  const g = { f: pct(val('paypalPct')), s: pct(val('surcharge')), fxBuffer: pct(val('fxBuffer')), idrStep: plain(val('idrStep')), split: sp };
   const d = {};
-  for (const f of DESIGN_FIELDS) d[f.k] = val('d_' + f.k);
-  d.m = pct(d.m);
+  for (const f of DESIGN_FIELDS) d[f.k] = (f.type === 'pct' ? pct : plain)(val('d_' + f.k));
 
   const box = $('res'), sw = $('sweeps');
   box.replaceChildren();
@@ -601,7 +614,7 @@ function render() {
       const r = calcDesign(d, g, rs);
       if (!r.ok) box.append(errBox(niceErr(r.error)));
       else {
-        const cur = (c, v) => [el('span', { class: 'cur' }, c), v];
+        const cur = (c, v) => { const p = curParts(c, v); return [p.sign, el('span', { class: 'cur' }, p.cur), ' ' + p.num]; };
         const stat = (en, zh, value, cls) => el('div', { class: 'stat' + (cls ? ' ' + cls : '') }, el('span', { class: 'stat-k' }, en, el('small', {}, zh)), el('strong', { class: 'stat-v' }, ...value));
         box.append(
           el('div', { class: 'hero' },
@@ -632,7 +645,7 @@ function render() {
       drawCharts(r, rows);
     } catch (e) { box.append(errBox('Unexpected error 意外错误: ' + e.message)); drawCharts(null, []); }
   }
-  if (formatBad) box.append(errBox('Some fields are not numbers (red). 部分字段不是数字(红色)。'));
+  if (formatBad) box.append(errBox('Some fields are not numbers (red). Use a dot for decimals, e.g. 1.5. 部分字段不是数字(红色)。小数请用点号,例如 1.5。'));
 }
 
 // ---- Scenarios: save/load in the browser (localStorage) + export/import file ----
@@ -722,7 +735,13 @@ function buildScenarios() {
 
 // ---- Theme: system by default; the button switches light/dark and the choice is remembered (pc-theme). The inline script in <head> sets the first value before paint.
 const themeBtn = $('themeBtn');
-const setTheme = (t) => { document.documentElement.setAttribute('data-theme', t); themeBtn.setAttribute('aria-pressed', String(t === 'dark')); };
+const setTheme = (t) => {
+  const dark = t === 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+  themeBtn.setAttribute('aria-pressed', String(dark));
+  // the label shows the current state (icon + on/off), not only the border
+  themeBtn.replaceChildren(el('span', {}, el('i', { 'aria-hidden': 'true' }, dark ? '\u263E' : '\u2600\uFE0E'), dark ? ' Dark mode: on' : ' Dark mode: off'), el('small', {}, dark ? '深色模式:开' : '深色模式:关'));
+};
 setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light');
 themeBtn.addEventListener('click', () => {
   const t = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
