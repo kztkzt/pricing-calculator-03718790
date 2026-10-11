@@ -6,25 +6,34 @@
 <meta name="robots" content="noindex,nofollow,noarchive">
 <title>Pricing Calculator 定价计算器</title>
 <link rel="stylesheet" href="style.css">
+<script>(function(){var t=null;try{t=localStorage.getItem("pc-theme")}catch(e){}if(t!=="light"&&t!=="dark"){t=window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}document.documentElement.setAttribute("data-theme",t)})()</script>
 </head>
 <body>
-<header>
+<header class="appbar">
   <h1>Pricing Calculator <small>定价计算器</small></h1>
-  <button type="button" id="pdfBtn" class="noprint">Download PDF<small>下载PDF</small></button>
+  <div class="appbar-actions noprint">
+    <button type="button" id="themeBtn" class="btn btn-secondary" aria-pressed="false"><span><i aria-hidden="true">&#9790;</i> Dark mode</span><small>深色模式</small></button>
+    <button type="button" id="pdfBtn" class="btn btn-primary">Download PDF<small>下载PDF</small></button>
+  </div>
 </header>
 <main>
   <section id="scenarios" class="card"></section>
-  <section id="globals" class="card">
-    <h2>Global settings <small>全局设置</small></h2>
-    <div id="globalFields" class="grid"></div>
-    <div id="splitCheck" class="note"></div>
-    <div id="cnyRef" class="note"></div>
-    <p class="note">Shipping surcharge does not fully cover PayPal's fee on shipping; the small shortfall is borne by the partners.
-      <small>运费附加费无法完全覆盖运费部分的PayPal手续费,差额由合伙人承担。</small></p>
-  </section>
-  <p class="note">Unrounded values <small>未四舍五入</small></p>
-  <section id="designs" class="designs"></section>
-  <section id="yearly" class="card"></section>
+  <div class="layout">
+    <section id="design" class="card"></section>
+    <section id="results" class="card results">
+      <h2>Results <small>结果</small></h2>
+      <div id="res"></div>
+      <p class="note">Unrounded values <small>未四舍五入</small></p>
+    </section>
+    <section id="globals" class="card">
+      <h2>Global settings <small>全局设置</small></h2>
+      <div id="globalFields" class="grid"></div>
+      <div id="splitCheck" class="note"></div>
+      <div id="cnyRef" class="note"></div>
+      <p class="note">Shipping surcharge does not fully cover PayPal's fee on shipping; the small shortfall is borne by the partners.
+        <small>运费附加费无法完全覆盖运费部分的PayPal手续费,差额由合伙人承担。</small></p>
+    </section>
+  </div>
   <section id="charts"></section>
   <section id="sweeps"></section>
 </main>

@@ -3,7 +3,7 @@
 const __m_calcEngine = (() => {
 // Pricing calc engine. Pure functions, no UI, no floats: all math is exact BigInt fractions.
 // No rounding in the math. Output strings only cut the exact fraction to 4 decimals for display (half up).
-// IDR is not rounded unless the user sets idrStep > 0. Spec: docs/T1-formula-spec.md (v4).
+// IDR is not rounded unless the user sets idrStep > 0. Spec: docs/spec-v5.md.
 
 // ---- exact fractions: { n: BigInt, d: BigInt > 0 } ----
 const gcd = (a, b) => { a = a < 0n ? -a : a; while (b) [a, b] = [b, a % b]; return a; };
@@ -140,7 +140,7 @@ function unitOut(x, rates = {}, { fxBuffer, idrStep }) {
     P: fmt(x.P), S: fmt(x.S), R: fmt(x.R), paypal: fmt(x.paypal), profit: fmt(x.profit),
     split: fmtSplit(x.split),
     cny: null, idr: null,
-    exact: x, // BigInt fractions, for yearly sums / tests
+    exact: x, // BigInt fractions, for tests
   };
   const r = parseDec(rates.r), ix = parseDec(rates.x);
   if (r && sign(r) > 0) out.cny = fmt(mul(x.P, r));
@@ -161,49 +161,39 @@ function sweepUnit(input, globals, margins, rates) {
   return margins.map((m) => ({ m, ...calcUnit({ ...input, m }, globals, rates) }));
 }
 
-// designs: [{ c, m, F?, Sc?, u?, K? }], globals: { f, s?, shared? }
-function calcYearly(designs = [], globals = {}) {
-  const sh = field(globals, 'shared');
-  if (sh.error) return err(sh.error);
-  const ex = parseExtras(globals);
-  if (ex.error) return err(ex.error);
-  let profitSum = ZERO, ksum = ZERO, rev = ZERO;
-  const rows = [];
-  for (let idx = 0; idx < designs.length; idx++) {
-    const d = designs[idx];
-    const p = parseUnit(d, globals);
-    if (!p.ok) return err(`design ${idx + 1}: ${p.error}`);
-    const K = field(d, 'K');
-    if (K.error) return err(`design ${idx + 1}: ${K.error}`);
-    const uRaw = d.u === undefined || d.u === null || String(d.u).trim() === '' ? ZERO : parseDec(d.u);
-    if (!uRaw || uRaw.d !== 1n || sign(uRaw) < 0) return err(`design ${idx + 1}: u must be an integer >= 0`);
-    const x = unitExact(p.v);
-    const dp = mul(x.profit, uRaw);
-    profitSum = add(profitSum, dp);
-    ksum = add(ksum, K.v);
-    rev = add(rev, mul(x.P, uRaw));
-    rows.push({ P: fmt(x.P), profit: fmt(x.profit), designProfit: fmt(dp), K: fmt(K.v), afterK: fmt(sub(dp, K.v)) });
-  }
-  const net = sub(sub(profitSum, ksum), sh.v);
-  const sp = splitOf(net, ex.split);
+// One design (spec v5): calcUnit fields plus total, K, net after collab, split of net, margin after collab.
+// input: { c, m, F?, Sc?, u? (integer >= 0, blank = 0), K? (>= 0, blank = 0; total collab budget, subtracted once) }
+// Returns calcUnit fields (split = per unit) + { u, K, total, net, netSplit{A,B,C}, marginAfterCollab ('n/a' if P*u = 0), exact }.
+function calcDesign(input = {}, globals = {}, rates = {}) {
+  const p = parseUnit(input, globals);
+  if (!p.ok) return p;
+  const K = field(input, 'K');
+  if (K.error) return err(K.error);
+  const u = parseDec(input.u, ZERO);
+  if (!u || u.d !== 1n || sign(u) < 0) return err('u must be an integer >= 0');
+  const x = unitExact(p.v);
+  const total = mul(x.profit, u);
+  const net = sub(total, K.v);
+  const netSplit = splitOf(net, p.v.split);
+  const rev = mul(x.P, u);
+  const margin = sign(rev) === 0 ? null : mul(div(net, rev), fr(100n));
   return {
-    ok: true,
-    designs: rows,
-    profitTotal: fmt(profitSum), // chart A: yearly profit vs expenses (K total + shared)
-    expensesTotal: fmt(add(ksum, sh.v)),
-    net: fmt(net),
-    split: fmtSplit(sp),
-    marginAfterShared: sign(rev) === 0 ? 'n/a' : fmt(mul(div(net, rev), fr(100n))) + '%',
-    exact: { net, split: sp, revenue: rev },
+    ...unitOut(x, rates, p.v),
+    u: fmt(u, 0), K: fmt(K.v), total: fmt(total), net: fmt(net),
+    netSplit: fmtSplit(netSplit),
+    marginAfterCollab: margin ? fmt(margin) + '%' : 'n/a',
+    exact: { ...x, total, net, netSplit, margin },
   };
 }
 
-// Yearly result for each margin in `margins` applied to every design (charts C, D).
-function sweepYearly(designs, globals, margins) {
-  return margins.map((m) => ({ m, ...calcYearly(designs.map((d) => ({ ...d, m })), globals) }));
+const SWEEP_MARGINS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5];
+
+// calcDesign for each margin (default 20-50%, step 5). Same c, F, Sc, u, K for every row.
+function sweepDesign(input, globals, margins = SWEEP_MARGINS, rates) {
+  return margins.map((m) => ({ m, ...calcDesign({ ...input, m }, globals, rates) }));
 }
 
-return { parseDec, roundIdr, splitSum, calcUnit, sweepUnit, calcYearly, sweepYearly };
+return { parseDec, roundIdr, splitSum, calcUnit, sweepUnit, calcDesign, SWEEP_MARGINS, sweepDesign };
 })();
 const __m_cnyRate = (() => {
 // USD->CNY reference rate. Source: Frankfurter (ECB-based), free, no key, CORS open.
@@ -249,8 +239,11 @@ const h = (tag, attrs = {}, ...kids) => {
   return e;
 };
 
-const W = 560, H = 300, L = 74, R = 12, T = 18, B = 52;
-const PAL = ['#2563eb', '#d97706', '#059669'];
+// W is set per chart to the real container width (px), so SVG text stays at its true size on a phone.
+let W = 560;
+const H = 280, R = 14, T = 20, B = 56;
+let L = 68; // left margin, widened per chart when the y-axis numbers are long
+const PAL = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)'];
 
 function niceScale(vals) {
   let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
@@ -264,11 +257,12 @@ function niceScale(vals) {
 
 function frame(vals, tickFmt) {
   const sc = niceScale(vals);
+  L = Math.max(60, Math.max(...sc.ticks.map((t) => tickFmt(t).length)) * 7 + 16);
   const y = (v) => T + (H - T - B) * (1 - (v - sc.min) / (sc.max - sc.min));
   const s = sv('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chartsvg', role: 'img' });
   for (const t of sc.ticks) {
-    s.append(sv('line', { x1: L, x2: W - R, y1: y(t), y2: y(t), stroke: t === 0 ? '#555' : '#e3e3e8', 'stroke-width': t === 0 ? 1.5 : 1 }));
-    s.append(sv('text', { x: L - 6, y: y(t) + 4, 'text-anchor': 'end', 'font-size': 11, fill: '#555' }, tickFmt(t)));
+    s.append(sv('line', { x1: L, x2: W - R, y1: y(t), y2: y(t), class: t === 0 ? 'c-axis' : 'c-grid' }));
+    s.append(sv('text', { x: L - 8, y: y(t) + 4, 'text-anchor': 'end', class: 'c-tick' }, tickFmt(t)));
   }
   return { s, y };
 }
@@ -280,16 +274,17 @@ const tick = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 4 });
 function barChart(groups, series, fmt) {
   const all = groups.flatMap((g) => g.vals.map(Number));
   const { s, y } = frame(all, tick);
-  const gw = (W - L - R) / groups.length, bw = Math.min(46, (gw * 0.8) / series.length);
+  const gw = (W - L - R) / groups.length, bw = Math.min(96, (gw * 0.8) / series.length);
   groups.forEach((g, gi) => {
     const x0 = L + gi * gw + (gw - bw * series.length) / 2;
     g.vals.forEach((v, si) => {
       const n = Number(v), x = x0 + si * bw, top = y(Math.max(n, 0)), bot = y(Math.min(n, 0));
-      const bar = sv('rect', { x: x + 2, y: top, width: bw - 4, height: Math.max(bot - top, 1), fill: series[si].color });
+      const bar = sv('rect', { x: x + 2, y: top, width: bw - 4, height: Math.max(bot - top, 1), style: `fill:${series[si].color}` });
       bar.append(sv('title', {}, `${g.label} · ${series[si].name}: ${fmt(v)}`));
-      s.append(bar, sv('text', { x: x + bw / 2, y: n >= 0 ? top - 4 : bot + 12, 'text-anchor': 'middle', 'font-size': 10.5, fill: '#222' }, fmt(v)));
+      const half = fmt(v).length * 3.6; // keep the value label inside the chart
+      s.append(bar, sv('text', { x: Math.min(Math.max(x + bw / 2, half + 2), W - half - 2), y: n >= 0 ? top - 6 : bot + 14, 'text-anchor': 'middle', class: 'c-val' }, fmt(v)));
     });
-    const lab = sv('text', { x: L + gi * gw + gw / 2, y: H - B + 18, 'text-anchor': 'middle', 'font-size': 12, fill: '#222' }, trunc(g.label));
+    const lab = sv('text', { x: L + gi * gw + gw / 2, y: H - B + 20, 'text-anchor': 'middle', class: 'c-label' }, trunc(g.label));
     lab.append(sv('title', {}, g.label));
     s.append(lab);
   });
@@ -301,11 +296,11 @@ function lineChart(xs, series, fmt, xTitle) {
   const all = series.flatMap((r) => r.pts.filter((v) => v !== null).map(Number));
   const { s, y } = frame(all, tick);
   const x = (i) => L + 14 + (W - L - R - 28) * (i / (xs.length - 1));
-  xs.forEach((t, i) => s.append(sv('text', { x: x(i), y: H - B + 18, 'text-anchor': 'middle', 'font-size': 11, fill: '#222' }, t)));
-  s.append(sv('text', { x: (L + W - R) / 2, y: H - 8, 'text-anchor': 'middle', 'font-size': 12, fill: '#444' }, xTitle));
+  xs.forEach((t, i) => s.append(sv('text', { x: x(i), y: H - B + 20, 'text-anchor': 'middle', class: 'c-label' }, t)));
+  s.append(sv('text', { x: (L + W - R) / 2, y: H - 10, 'text-anchor': 'middle', class: 'c-title' }, xTitle));
   series.forEach((r) => {
     let seg = [];
-    const flush = () => { if (seg.length > 1) s.append(sv('polyline', { points: seg.join(' '), fill: 'none', stroke: r.color, 'stroke-width': 2 })); seg = []; };
+    const flush = () => { if (seg.length > 1) s.append(sv('polyline', { points: seg.join(' '), style: `fill:none;stroke:${r.color}`, 'stroke-width': 2.5 })); seg = []; };
     const last = r.pts.reduce((a, v, i) => (v !== null ? i : a), -1);
     r.pts.forEach((v, i) => {
       if (v === null) { flush(); return; }
@@ -314,11 +309,11 @@ function lineChart(xs, series, fmt, xTitle) {
     flush();
     r.pts.forEach((v, i) => {
       if (v === null) return;
-      const c = sv('circle', { cx: x(i), cy: y(Number(v)), r: 3.5, fill: r.color });
+      const c = sv('circle', { cx: x(i), cy: y(Number(v)), r: 4, style: `fill:${r.color}` });
       c.append(sv('title', {}, `${r.name} @ ${xs[i]}: ${fmt(v)}`));
       s.append(c);
       if (i === last) {
-        s.append(sv('text', { x: x(i), y: y(Number(v)) - 8, 'text-anchor': 'end', 'font-size': 11, fill: r.color }, fmt(v)));
+        s.append(sv('text', { x: x(i), y: y(Number(v)) - 10, 'text-anchor': 'end', class: 'c-val' }, fmt(v)));
       }
     });
   });
@@ -326,76 +321,82 @@ function lineChart(xs, series, fmt, xTitle) {
 }
 
 const legend = (series) => h('div', { class: 'legend' }, ...series.map((r) => h('span', {}, h('i', { style: `background:${r.color}` }), r.name)));
-function card(en, zh, series, svgEl) {
+function card(box, en, zh, series, draw) {
   const t = h('h2', {}, en + ' ');
   t.append(h('small', {}, zh));
-  return h('div', { class: 'card chart' }, t, legend(series), h('div', { class: 'scroll' }, svgEl));
+  const wrap = h('div', { class: 'chartwrap' });
+  box.append(h('div', { class: 'card chart' }, t, legend(series), wrap));
+  W = Math.max(260, Math.floor(wrap.clientWidth)); // measure after insertion
+  wrap.append(draw());
 }
 const hint = (en, zh) => h('div', { class: 'card chart' }, h('p', { class: 'hint' }, `${en} ${zh}`));
 
-// data: { names: [string], yearly: calcYearly result | null, margins: ['20%',...], price: [[str|null]], afterK: [[str|null]] }
+// data: { design: calcDesign result | null, margins: ['20%',...], price: [str|null], net: [str|null] }
 function renderCharts(box, data, fmt) {
   box.replaceChildren();
-  const { names, yearly, margins, price, afterK } = data;
-  if (!names.length) { box.append(hint('Charts need at least one design.', '图表需要至少一个设计。')); return; }
+  const { design, margins, price, net } = data;
+  if (!price.length && !design) { box.append(hint('Charts need a unit cost.', '图表需要先输入单位成本。')); return; }
 
-  if (yearly) {
-    const sA = [{ name: 'Profit / year 年度利润', color: '#059669' }, { name: 'Expenses: collab K (Yearly: K + shared) 开支:合作预算(全年:预算+共同开支)', color: '#dc2626' }];
-    const groups = names.map((n, i) => ({ label: n, vals: [yearly.designs[i].designProfit, yearly.designs[i].K] }));
-    groups.push({ label: 'Yearly 全年', vals: [yearly.profitTotal, yearly.expensesTotal] });
-    box.append(card('A. Profit vs expenses', 'A. 利润与开支', sA, barChart(groups, sA, fmt)));
-    const sB = [{ name: 'Net profit / year after collab & shared 扣除合作及共同开支后年度净利', color: '#2563eb' }];
-    box.append(card('B. Yearly net profit split A / B / C', 'B. 年度净利分成 A / B / C', sB,
-      barChart([{ label: 'A', vals: [yearly.split.A] }, { label: 'B', vals: [yearly.split.B] }, { label: 'C', vals: [yearly.split.C] }], sB, fmt)));
+  if (design) {
+    const sA = [{ name: 'Total profit 总利润', color: 'var(--chart-3)' }, { name: 'Expenses: collab K 开支:合作预算K', color: 'var(--chart-4)' }];
+    card(box, 'A. Profit vs expenses', 'A. 利润与开支', sA, () => barChart([{ label: 'Design 设计', vals: [design.total, design.K] }], sA, fmt));
+    const sB = [{ name: 'Net profit after collab K 扣除合作预算后净利', color: 'var(--chart-1)' }];
+    card(box, 'B. Net profit split A / B / C', 'B. 净利分成 A / B / C', sB,
+      () => barChart([{ label: 'A', vals: [design.netSplit.A] }, { label: 'B', vals: [design.netSplit.B] }, { label: 'C', vals: [design.netSplit.C] }], sB, fmt));
   } else {
     box.append(hint('Charts A and B need valid inputs.', '图表A和B需要有效输入。'));
   }
-  const series = (rows) => names.map((n, i) => ({ name: n, color: PAL[i % PAL.length], pts: rows[i] }));
   const xt = 'Margin 利润率';
-  const line = (en, zh, rows) => box.append(rows.some((r) => r.some((v) => v !== null))
-    ? card(en, zh, series(rows), lineChart(margins, series(rows), fmt, xt))
-    : hint(en + ': no valid values, check inputs.', zh + ':无有效数值,请检查输入。'));
-  line('C. Price (USD) vs margin', 'C. 美元售价与利润率', price);
-  line('D. Yearly net profit (after collab K) vs margin', 'D. 年度净利(扣合作预算后)与利润率', afterK);
+  const line = (en, zh, name, pts) => (pts.some((v) => v !== null)
+    ? card(box, en, zh, [{ name, color: PAL[0] }], () => lineChart(margins, [{ name, color: PAL[0], pts }], fmt, xt))
+    : box.append(hint(en + ': no valid values, check inputs.', zh + ':无有效数值,请检查输入。')));
+  line('C. Price (USD) vs margin', 'C. 美元售价与利润率', 'Price USD 美元售价', price);
+  line('D. Net profit (after collab K) vs margin', 'D. 净利(扣合作预算后)与利润率', 'Net after collab K 扣合作预算净利', net);
 }
 
 return { renderCharts };
 })();
 const __m_defaults = (() => {
-// Starting values of the three design cards. All three ship blank: no sample numbers.
-const DESIGN_DEFAULTS = [
-  { name: 'Design 1', c: '', m: '35', F: '0', Sc: '0', u: '0', K: '0' },
-  { name: 'Design 2', c: '', m: '35', F: '0', Sc: '0', u: '0', K: '0' },
-  { name: 'Design 3', c: '', m: '35', F: '0', Sc: '0', u: '0', K: '0' },
-];
+// Starting values of the design card. Ships blank: no sample numbers.
+const DESIGN_DEFAULT = { c: '', m: '35', F: '0', Sc: '0', u: '0', K: '0' };
 
-return { DESIGN_DEFAULTS };
+return { DESIGN_DEFAULT };
 })();
 const __m_storage = (() => {
 // Scenario save/load + export/import. No DOM here, so it runs in node tests.
 // A scenario = the text of every input field, exactly as typed ({ fieldId: "text" }).
 // Same text in => same engine numbers out (the engine is deterministic), so a reload is identical.
+// File shape v2 (single design): { app, v: 2, name, saved, fields }. v1 (multi-design, `version: 1`) is migrated to Design 1.
 const APP = 'pricing-calculator';
-const VERSION = 1;
-const KEY = 'pricingCalc.scenarios.v1';
+const VERSION = 2;
+const KEY = 'pricingCalc.scenarios.v1'; // same key as v1 builds; each entry is a snapshot and carries its own version
 
 function makeSnapshot(name, fields) {
-  return { app: APP, version: VERSION, name, saved: new Date().toISOString(), fields: { ...fields } };
+  return { app: APP, v: VERSION, name, saved: new Date().toISOString(), fields: { ...fields } };
 }
 
-// Returns { ok: true, snap } or { ok: false, error }. ids = every field id the page has.
+const V1_NOTICE = 'Old multi-design file (v1): only Design 1 and the global settings were loaded; Designs 2-3, shared expenses and yearly results were dropped. 旧版多设计文件(v1):仅载入设计1和全局设置,设计2-3、共同开支和年度结果已舍弃。';
+
+// Returns { ok: true, snap, notice? } or { ok: false, error }. ids = every field id the page has.
 function parseSnapshot(text, ids) {
   let o;
   try { o = JSON.parse(text); } catch { return { ok: false, error: 'Not a valid file 文件无效 (not JSON)' }; }
   if (!o || o.app !== APP || typeof o.fields !== 'object' || o.fields === null) {
     return { ok: false, error: 'Not a pricing calculator file 不是本计算器的文件' };
   }
-  if (o.version !== VERSION) return { ok: false, error: `Unsupported file version 不支持的版本: ${o.version}` };
-  const missing = ids.filter((id) => typeof o.fields[id] !== 'string');
-  if (missing.length) return { ok: false, error: `File is missing fields 文件缺少字段: ${missing.join(', ')}` };
+  const v1 = o.v === undefined && o.version === 1;
+  if (o.v !== VERSION && !v1) return { ok: false, error: `Unsupported file version 不支持的版本: ${o.v ?? o.version}` };
+  let src = o.fields;
+  if (v1) { // Design 1 fields d0_x become d_x; other designs and "shared" are simply not read
+    src = { ...o.fields };
+    for (const k of ['c', 'm', 'F', 'Sc', 'u', 'K']) src['d_' + k] = o.fields['d0_' + k];
+  }
+  const missing = ids.filter((id) => typeof src[id] !== 'string');
+  if (missing.length) return { ok: false, error: `File is missing fields 文件缺少字段: ${missing.map((id) => (v1 ? id.replace(/^d_/, 'd0_') : id)).join(', ')}` };
   const fields = {};
-  for (const id of ids) fields[id] = o.fields[id];
-  return { ok: true, snap: { ...o, name: typeof o.name === 'string' ? o.name : '', fields } };
+  for (const id of ids) fields[id] = src[id];
+  const snap = { app: APP, v: VERSION, name: typeof o.name === 'string' ? o.name : '', saved: o.saved, fields };
+  return v1 ? { ok: true, snap, notice: V1_NOTICE } : { ok: true, snap };
 }
 
 // store = localStorage-like (getItem/setItem). Throws if the browser blocks storage.
@@ -421,10 +422,10 @@ return { APP, VERSION, makeSnapshot, parseSnapshot, listScenarios, getScenario, 
 })();
 const __m_ui = (() => {
 // Input UI. Wires fields to calcEngine.js; no math here except "5" -> "5e-2" percent text conversion.
-const { calcUnit, calcYearly, parseDec, splitSum, sweepUnit, sweepYearly } = __m_calcEngine;
+const { calcDesign, parseDec, splitSum, sweepDesign } = __m_calcEngine;
 const { getCnyRate, SOURCE_PAGE } = __m_cnyRate;
 const { renderCharts } = __m_charts;
-const { DESIGN_DEFAULTS } = __m_defaults;
+const { DESIGN_DEFAULT } = __m_defaults;
 const { makeSnapshot, parseSnapshot, listScenarios, getScenario, saveScenario, deleteScenario } = __m_storage;
 
 const $ = (id) => document.getElementById(id);
@@ -436,7 +437,7 @@ const el = (tag, attrs = {}, ...kids) => {
   for (const k of kids) e.append(k);
   return e;
 };
-const lab = (en, zh) => [en, el('small', {}, zh)];
+const lab = (en, zh) => [el('span', { class: 'lbl' }, el('span', { class: 'en' }, en), el('small', {}, zh))];
 
 // type: 'pct' (typed as 5 for 5%), 'num', 'int', 'text', 'date'
 const GLOBAL_FIELDS = [
@@ -449,35 +450,34 @@ const GLOBAL_FIELDS = [
   { id: 'idrDate', en: 'IDR rate date', zh: '印尼盾汇率日期', type: 'date', value: '' },
   { id: 'fxBuffer', en: 'FX buffer %', zh: '汇率缓冲 %', type: 'pct', value: '2' },
   { id: 'idrStep', en: 'IDR rounding step (0 = no rounding)', zh: '印尼盾进位单位(0=不进位)', type: 'int', value: '0' },
-  { id: 'shared', en: 'Other shared expenses per year (USD)', zh: '每年其他共同开支(美元)', type: 'num', value: '0' },
   { id: 'splitA', en: 'Split A %', zh: '分成 A %', type: 'pct', value: '60' },
   { id: 'splitB', en: 'Split B %', zh: '分成 B %', type: 'pct', value: '30' },
   { id: 'splitC', en: 'Split C %', zh: '分成 C %', type: 'pct', value: '10' },
 ];
 
 const DESIGN_FIELDS = [
-  { k: 'name', en: 'Name', zh: '名称', type: 'text' },
   { k: 'c', en: 'Unit cost c (USD, excl. shipping)', zh: '单位成本(美元,不含运费)', type: 'num' },
   { k: 'm', en: 'Target margin %', zh: '目标利润率 %', type: 'pct' },
   { k: 'F', en: 'PayPal fixed fee F (USD)', zh: 'PayPal固定费用(美元)', type: 'num' },
   { k: 'Sc', en: 'Real 4PX shipping cost Sc (USD)', zh: '4PX实际运费(美元)', type: 'num' },
-  { k: 'u', en: 'Units per year', zh: '每年数量', type: 'int' },
-  { k: 'K', en: 'Collab budget K (USD)', zh: '合作预算(美元)', type: 'num' },
+  { k: 'u', en: 'Units for this design / release', zh: '本设计/本次发售数量', type: 'int' },
+  { k: 'K', en: 'Collab budget K (USD, total for this design / release)', zh: '合作预算K(美元,本设计/本次发售合计)', type: 'num' },
 ];
 
 const FIELD_NAMES = {
   c: 'Unit cost 单位成本', m: 'Margin 利润率', f: 'PayPal % PayPal手续费', F: 'PayPal fixed fee 固定费用',
   fxBuffer: 'FX buffer 汇率缓冲', idrStep: 'IDR rounding step 印尼盾进位单位', split: 'Split 分成',
-  Sc: 'Shipping cost 运费', s: 'Surcharge 附加费', u: 'Units 数量', K: 'Collab K 合作预算', shared: 'Shared expenses 共同开支',
+  Sc: 'Shipping cost 运费', s: 'Surcharge 附加费', u: 'Units 数量', K: 'Collab K 合作预算',
 };
 const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)$/;
 const blank = (v) => v === undefined || v === null || String(v).trim() === '';
 const okFormat = (type, v) => blank(v) || type === 'text' || type === 'date' || NUM_RE.test(v.trim());
 // percent text -> engine decimal text ("5" -> "5e-2"); bad text passes through so the engine rejects it
 const pct = (v) => (blank(v) ? '' : NUM_RE.test(v.trim()) ? v.trim() + 'e-2' : v);
-const niceErr = (msg) => msg.replace(/^(design \d+: )?(\w+)/, (m, p, k) => (p || '') + (FIELD_NAMES[k] || k))
+const niceErr = (msg) => msg.replace(/^(\w+)/, (m, k) => FIELD_NAMES[k] || k)
   .replace('Split 分成 must sum to 1', 'Split A + B + C must be 100% 分成合计须为100%')
   .replace(' must be an integer >= 0', ' must be a whole number, 0 or more 必须是不小于0的整数')
+  .replace(' must be >= 0', ' must be 0 or more 必须不小于0')
   .replace('margin too high', 'Margin + PayPal % must be below 100% 利润率+PayPal手续费须低于100%')
   .replace(/ required$/, ' is required 必填').replace(/ invalid$/, ' is not a number 不是有效数字');
 const commas = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -496,18 +496,15 @@ function buildInput(f, idAttr) {
 function build() {
   const gf = $('globalFields');
   for (const f of GLOBAL_FIELDS) {
-    const l = el('label', {}, ...lab(f.en, f.zh), buildInput(f, f.id));
+    const l = el('label', { class: 'field' }, ...lab(f.en, f.zh), buildInput(f, f.id));
     if (f.note) l.append(el('span', { class: 'err warn' }, f.note[0], el('small', {}, f.note[1])));
     gf.append(l);
   }
-  DESIGN_DEFAULTS.forEach((d, n) => {
-    const card = el('div', { class: 'card', id: 'design' + n });
-    card.append(el('h2', {}, `Design ${n + 1} `, el('small', {}, `设计 ${n + 1}`)));
-    const g = el('div', { class: 'grid' });
-    for (const f of DESIGN_FIELDS) g.append(el('label', {}, ...lab(f.en, f.zh), buildInput({ ...f, value: d[f.k] }, `d${n}_${f.k}`)));
-    card.append(g, el('div', { class: 'result', id: 'res' + n }));
-    $('designs').append(card);
-  });
+  const card = $('design');
+  card.append(el('h2', {}, 'Design ', el('small', {}, '设计')));
+  const g = el('div', { class: 'grid' });
+  for (const f of DESIGN_FIELDS) g.append(el('label', { class: 'field' }, ...lab(f.en, f.zh), buildInput({ ...f, value: DESIGN_DEFAULT[f.k] }, 'd_' + f.k)));
+  card.append(g);
   document.addEventListener('input', render);
 }
 
@@ -525,44 +522,31 @@ function checkFormats() {
 
 function row(a, b, cls) { return el('tr', cls ? { class: cls } : {}, el('td', {}, a), el('td', {}, b)); }
 const MARGINS = [20, 25, 30, 35, 40, 45, 50];
-const SWEEP_HEAD = ['Margin 利润率', 'Price USD 美元售价', 'CNY 人民币', 'IDR 印尼盾', 'PayPal fee 手续费', 'Profit / unit 单件利润', 'Profit / year 年度利润', 'After collab K 扣合作预算'];
+const SWEEP_HEAD = ['Margin 利润率', 'Price USD 美元售价', 'CNY 人民币', 'IDR 印尼盾', 'PayPal fee 手续费', 'Profit / unit 单件利润', 'Total profit 总利润', 'Net after collab K 扣合作预算净利'];
 
-// Margin table 20-50% (step 5) for one design; all numbers come from sweepUnit / sweepYearly.
-function sweepCard(d, n, g, rt) {
-  const ms = MARGINS.map((p) => pct(String(p)));
-  const us = sweepUnit(d, g, ms, rt);
-  const ys = sweepYearly([d], g, ms);
+// Margin table 20-50% (step 5) for the design; every number comes from sweepDesign.
+function sweepCard(rows) {
   const t = el('table', { class: 'sweep' });
   t.append(el('thead', {}, el('tr', {}, ...SWEEP_HEAD.map((h) => el('th', {}, h)))));
   const body = el('tbody');
-  us.forEach((u, i) => {
+  rows.forEach((r, i) => {
     const pctTxt = MARGINS[i] + '%';
-    if (!u.ok) { body.append(el('tr', {}, el('td', {}, pctTxt), el('td', { colspan: '7', class: 'err' }, niceErr(u.error)))); return; }
-    const y = ys[i].ok ? ys[i].designs[0] : null;
-    body.append(el('tr', {}, el('td', {}, pctTxt), el('td', {}, money(u.P)), el('td', {}, u.cny ? money(u.cny) : '—'),
-      el('td', {}, u.idr ? money(u.idr) : '—'), el('td', {}, money(u.paypal)), el('td', {}, money(u.profit)),
-      el('td', {}, y ? money(y.designProfit) : '—'), el('td', {}, y ? money(y.afterK) : '—')));
+    if (!r.ok) { body.append(el('tr', {}, el('td', { 'data-label': SWEEP_HEAD[0] }, pctTxt), el('td', { colspan: '7', class: 'err' }, niceErr(r.error)))); return; }
+    const cells = [pctTxt, money(r.P), r.cny ? money(r.cny) : '—', r.idr ? money(r.idr) : '—', money(r.paypal), money(r.profit), money(r.total), money(r.net)];
+    body.append(el('tr', {}, ...cells.map((c, k) => el('td', { 'data-label': SWEEP_HEAD[k] }, c))));
   });
   t.append(body);
-  const name = blank(d.name) ? `Design ${n + 1}` : d.name;
-  return el('div', { class: 'card' }, el('h2', {}, `Margin table 利润率表: ${name}`), el('div', { class: 'scroll' }, t));
+  return el('div', { class: 'card' }, el('h2', {}, 'Margin table ', el('small', {}, '利润率表')), el('div', { class: 'scroll' }, t));
 }
 const errBox = (msg) => el('p', { class: 'err' }, msg);
 
-// Same engine calls as the tables (calcYearly, sweepUnit, sweepYearly), so chart values equal table values.
-function drawCharts(used, g, rt) {
-  const ds = used.map(({ d }) => d);
-  const ms = MARGINS.map((p) => pct(String(p)));
-  const yr = ds.length ? calcYearly(ds, g) : null;
-  const price = [], afterK = [];
-  ds.forEach((d) => {
-    const us = sweepUnit(d, g, ms, rt), ys = sweepYearly([d], g, ms);
-    price.push(us.map((u) => (u.ok ? u.P : null)));
-    afterK.push(ys.map((y) => (y.ok ? y.designs[0].afterK : null)));
-  });
+// Chart values come from the same calcDesign / sweepDesign results as the tables.
+function drawCharts(r, rows) {
   renderCharts($('charts'), {
-    names: used.map(({ d, n }) => (blank(d.name) ? `Design ${n + 1}` : d.name)),
-    yearly: yr && yr.ok ? yr : null, margins: MARGINS.map((p) => p + '%'), price, afterK,
+    design: r && r.ok ? r : null,
+    margins: MARGINS.map((p) => p + '%'),
+    price: rows.map((x) => (x.ok ? x.P : null)),
+    net: rows.map((x) => (x.ok ? x.net : null)),
   }, money);
 }
 
@@ -595,74 +579,64 @@ function render() {
   const formatBad = checkFormats();
   renderCnyRef();
   const rt = rates();
-  const idrTxt = val('idrRate').trim();
   const sp = { A: pct(val('splitA')), B: pct(val('splitB')), C: pct(val('splitC')) };
   const ss = splitSum(sp.A, sp.B, sp.C);
   $('splitCheck').replaceChildren(ss
     ? el('span', { class: ss.ok ? 'ok' : 'err' }, `Split sum 分成合计: ${ss.text}%` + (ss.ok ? ' ✓' : ' — must be 100% 须为100%'))
     : el('span', { class: 'err' }, 'Split sum 分成合计: — (enter numbers 请输入数字)'));
-  const g = { f: pct(val('paypalPct')), s: pct(val('surcharge')), shared: val('shared'), fxBuffer: pct(val('fxBuffer')), idrStep: val('idrStep'), split: sp };
-  const designs = DESIGN_DEFAULTS.map((_, n) => {
-    const o = {};
-    for (const f of DESIGN_FIELDS) o[f.k] = val(`d${n}_${f.k}`);
-    o.m = pct(o.m);
-    return o;
-  });
+  const g = { f: pct(val('paypalPct')), s: pct(val('surcharge')), fxBuffer: pct(val('fxBuffer')), idrStep: val('idrStep'), split: sp };
+  const d = {};
+  for (const f of DESIGN_FIELDS) d[f.k] = val('d_' + f.k);
+  d.m = pct(d.m);
 
-  designs.forEach((d, n) => {
-    const box = $('res' + n);
-    box.replaceChildren();
-    if (blank(d.c)) { box.append(el('p', { class: 'hint' }, 'Enter unit cost to see a price. 输入单位成本以查看价格。')); return; }
-    try {
-      const r = calcUnit(d, g, { r: rt.r, x: rt.x });
-      if (!r.ok) { box.append(errBox(niceErr(r.error))); return; }
-      const yr = calcYearly([d], g);
-      const yd = yr.ok ? yr.designs[0] : null;
-      const t = el('table');
-      t.append(row('Keyboard price P 键盘售价', 'USD ' + money(r.P)),
-        row('CNY price 人民币价格', r.cny ? '¥ ' + money(r.cny) : '—'),
-        row('IDR price 印尼盾价格', r.idr ? 'Rp ' + money(r.idr) : '—'),
-        row('Shipping charged S 收取运费', 'USD ' + money(r.S)),
-        row('Customer pays R 客户支付', 'USD ' + money(r.R)),
-        row('PayPal fee (% + fixed) PayPal手续费(比例+固定)', 'USD ' + money(r.paypal)),
-        row('Profit / unit 单件利润', 'USD ' + money(r.profit)),
-        row('A / B / C per unit 单件分成', `${money(r.split.A)} / ${money(r.split.B)} / ${money(r.split.C)}`),
-        row('Total profit / year 年度总利润', yd ? 'USD ' + money(yd.designProfit) : '—'),
-        row('After collab budget 扣除合作预算后', yd ? 'USD ' + money(yd.afterK) : '—'));
-      box.append(t);
-    } catch (e) { box.append(errBox('Unexpected error 意外错误: ' + e.message)); }
-  });
-
-  const y = $('yearly');
-  y.replaceChildren(el('h2', {}, 'Yearly result ', el('small', {}, '年度结果')));
-  const used = designs.map((d, n) => ({ d, n })).filter(({ d }) => !blank(d.c));
-  const sw = $('sweeps');
+  const box = $('res'), sw = $('sweeps');
+  box.replaceChildren();
   sw.replaceChildren();
-  used.forEach(({ d, n }) => { try { sw.append(sweepCard(d, n, g, { r: rt.r, x: rt.x })); } catch (e) { sw.append(errBox('Unexpected error 意外错误: ' + e.message)); } });
-  try { drawCharts(used, g, rt); } catch (e) { $('charts').replaceChildren(errBox('Unexpected error 意外错误: ' + e.message)); }
-  if (!used.length) { y.append(el('p', { class: 'hint' }, 'Fill at least one design. 请至少填写一个设计。')); return; }
-  try {
-    const r = calcYearly(used.map(({ d }) => d), g);
-    if (!r.ok) {
-      const msg = r.error.replace(/^design (\d+)/, (m, k) => 'design ' + (used[k - 1].n + 1));
-      y.append(errBox(niceErr(msg)));
-      return;
-    }
-    const t = el('table');
-    used.forEach(({ d, n }, i) => {
-      const nm = blank(d.name) ? `Design ${n + 1}` : d.name;
-      t.append(row(`${nm}: profit / year, after collab 年度利润 / 扣合作预算后`, `USD ${money(r.designs[i].designProfit)} / ${money(r.designs[i].afterK)}`));
-    });
-    t.append(row('Net after collab & shared 扣除合作及共同开支后净利', 'USD ' + money(r.net)),
-      row('A / B / C', `${money(r.split.A)} / ${money(r.split.B)} / ${money(r.split.C)}`),
-      row('Margin after shared 共同开支后利润率', r.marginAfterShared));
-    y.append(el('div', { class: 'result' }, t));
-  } catch (e) { y.append(errBox('Unexpected error 意外错误: ' + e.message)); }
-  if (formatBad) y.append(errBox('Some fields are not numbers (red). 部分字段不是数字(红色)。'));
+  if (blank(d.c)) {
+    box.append(el('p', { class: 'hint' }, 'Enter unit cost to see a price. 输入单位成本以查看价格。'));
+    drawCharts(null, []);
+  } else {
+    try {
+      const rs = { r: rt.r, x: rt.x };
+      const r = calcDesign(d, g, rs);
+      if (!r.ok) box.append(errBox(niceErr(r.error)));
+      else {
+        const cur = (c, v) => [el('span', { class: 'cur' }, c), v];
+        const stat = (en, zh, value, cls) => el('div', { class: 'stat' + (cls ? ' ' + cls : '') }, el('span', { class: 'stat-k' }, en, el('small', {}, zh)), el('strong', { class: 'stat-v' }, ...value));
+        box.append(
+          el('div', { class: 'hero' },
+            stat('Price USD', '美元售价', cur('USD', money(r.P)), 'hero-main'),
+            stat('Price CNY', '人民币价格', r.cny ? cur('¥', money(r.cny)) : ['—']),
+            stat('Price IDR', '印尼盾价格', r.idr ? cur('Rp', money(r.idr)) : ['—'])),
+          el('div', { class: 'stats' },
+            stat('Profit / unit', '单件利润', cur('USD', money(r.profit))),
+            stat('Total profit', '总利润', cur('USD', money(r.total))),
+            stat('Net after collab K', '扣除合作预算后净利', cur('USD', money(r.net)), 'stat-key'),
+            stat('Margin after collab', '扣除后利润率', [String(r.marginAfterCollab)])),
+          el('div', { class: 'splits' },
+            el('h3', {}, 'Split A / B / C ', el('small', {}, '分成')),
+            el('table', {},
+              el('thead', {}, el('tr', {}, el('th', {}), el('th', {}, 'Per unit 单件'), el('th', {}, 'Net split 净利分成'))),
+              el('tbody', {},
+                ...['A', 'B', 'C'].map((k) => el('tr', {}, el('td', {}, k), el('td', {}, money(r.split[k])), el('td', {}, money(r.netSplit[k]))))))));
+        const t = el('table', { class: 'details' });
+        t.append(row('Shipping charged S 收取运费', 'USD ' + money(r.S)),
+          row('Customer pays R 客户支付', 'USD ' + money(r.R)),
+          row('PayPal fee (% + fixed) PayPal手续费(比例+固定)', 'USD ' + money(r.paypal)),
+          row('Units 数量', r.u),
+          row('Collab budget K 合作预算', 'USD ' + money(r.K)));
+        box.append(t);
+      }
+      const rows = sweepDesign(d, g, MARGINS.map((p) => pct(String(p))), rs);
+      sw.append(sweepCard(rows));
+      drawCharts(r, rows);
+    } catch (e) { box.append(errBox('Unexpected error 意外错误: ' + e.message)); drawCharts(null, []); }
+  }
+  if (formatBad) box.append(errBox('Some fields are not numbers (red). 部分字段不是数字(红色)。'));
 }
 
 // ---- Scenarios: save/load in the browser (localStorage) + export/import file ----
-const fieldIds = () => [...GLOBAL_FIELDS.map((f) => f.id), ...DESIGN_DEFAULTS.flatMap((_, n) => DESIGN_FIELDS.map((f) => `d${n}_${f.k}`))];
+const fieldIds = () => [...GLOBAL_FIELDS.map((f) => f.id), ...DESIGN_FIELDS.map((f) => 'd_' + f.k)];
 const collect = () => Object.fromEntries(fieldIds().map((id) => [id, val(id)]));
 const apply = (fields) => { for (const id of fieldIds()) $(id).value = fields[id]; render(); };
 const store = () => { try { return window.localStorage; } catch { return null; } };
@@ -673,8 +647,8 @@ function buildScenarios() {
   const pick = el('select');
   const status = el('div', { class: 'note' });
   name.dataset.type = 'text';
-  const btn = (en, zh, fn) => { const b = el('button', { type: 'button' }, en, el('small', {}, zh)); b.addEventListener('click', fn); return b; };
-  const say = (msg, bad) => status.replaceChildren(el('span', { class: bad ? 'err' : 'ok' }, msg));
+  const btn = (en, zh, fn, primary) => { const b = el('button', { type: 'button', class: 'btn ' + (primary ? 'btn-primary' : 'btn-secondary') }, en, el('small', {}, zh)); b.addEventListener('click', fn); return b; };
+  const say = (msg, bad, notice) => status.replaceChildren(el('span', { class: bad ? 'err' : 'ok' }, msg), ...(notice ? [el('div', { class: 'warn' }, notice)] : []));
   const refresh = (sel) => {
     let names = [];
     try { names = listScenarios(store()); } catch { /* storage blocked */ }
@@ -706,7 +680,7 @@ function buildScenarios() {
     if (!p.ok) return say(p.error, true);
     apply(p.snap.fields);
     name.value = pick.value;
-    say(`Loaded 已载入: ${pick.value}`);
+    say(`Loaded 已载入: ${pick.value}`, false, p.notice);
   };
   const del = () => {
     if (!pick.value || !window.confirm(`Delete "${pick.value}"? 删除 "${pick.value}"?`)) return;
@@ -734,23 +708,39 @@ function buildScenarios() {
     if (!p.ok) return say(p.error, true);
     apply(p.snap.fields);
     name.value = p.snap.name;
-    say(`Imported 已导入: ${f.name}`);
+    say(`Imported 已导入: ${f.name}`, false, p.notice);
   });
 
   box.append(el('h2', {}, 'Scenarios ', el('small', {}, '方案')),
-    el('div', { class: 'toolbar' }, name, btn('Save', '保存', save)),
+    el('div', { class: 'toolbar' }, name, btn('Save', '保存', save, true)),
     el('div', { class: 'toolbar' }, pick, btn('Load', '载入', load), btn('Delete', '删除', del)),
     el('div', { class: 'toolbar' }, btn('Export file', '导出文件', exportFile),
-      el('label', { class: 'filebtn' }, el('span', {}, 'Import file 导入文件'), file)),
+      el('label', { class: 'btn btn-secondary' }, el('span', {}, 'Import file'), el('small', {}, '导入文件'), file)),
     status);
   refresh();
 }
 
+// ---- Theme: system by default; the button switches light/dark and the choice is remembered (pc-theme). The inline script in <head> sets the first value before paint.
+const themeBtn = $('themeBtn');
+const setTheme = (t) => { document.documentElement.setAttribute('data-theme', t); themeBtn.setAttribute('aria-pressed', String(t === 'dark')); };
+setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light');
+themeBtn.addEventListener('click', () => {
+  const t = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  setTheme(t);
+  try { localStorage.setItem('pc-theme', t); } catch { /* storage blocked: choice lasts until reload */ }
+});
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+  let saved = null;
+  try { saved = localStorage.getItem('pc-theme'); } catch { /* ignore */ }
+  if (saved !== 'light' && saved !== 'dark') setTheme(e.matches ? 'dark' : 'light');
+});
 $('pdfBtn').addEventListener('click', () => window.print()); // browser print view; user saves as PDF
 build();
 buildScenarios();
 render();
 getCnyRate().then((r) => { live = { ...r, done: true }; render(); });
+let lastW = window.innerWidth; // charts are drawn to the container width, so redraw when the width changes
+window.addEventListener('resize', () => { if (window.innerWidth !== lastW) { lastW = window.innerWidth; render(); } });
 
 return {  };
 })();
